@@ -56,15 +56,16 @@ object DStreamWay {
                 case Some(value) => {
                   if (value.size == 10) {
                     //todo: remove oldest element first
-                    AggregatedEvents(value.size, value.clicks :: List(clicks), value.views :: List(views), value.categories :: List(categories))
+                    AggregatedEvents(value.size, value.clicks ++ List(clicks), value.views ++ List(views), value.categories ++ List(categories))
                   } else {
-                    AggregatedEvents(value.size + 1, value.clicks :: List(clicks), value.views :: List(views), value.categories :: List(categories))
+                    AggregatedEvents(value.size + 1, value.clicks ++ List(clicks), value.views ++ List(views), value.categories ++ List(categories))
                   }
                 }
                 case None => AggregatedEvents(1, List(clicks), List(views), List(categories))
               }
             )
-          }))
+          })
+        )
         .stateSnapshots
         .filter(key => {
           val clicks = key._2.clicks.sum

@@ -129,8 +129,8 @@ object DStreamWay {
           this.categories.get(e._1) match {
             case Some(v) => {
               v - e._2 match {
-                case value > 0 => this.categories.update(e._1, value)
-                case value == 0 => this.categories.remove(e._1)
+                case value if value > 0 => this.categories.update(e._1, value)
+                case value if value == 0 => this.categories.remove(e._1)
               }
             }
             //case None => this.categories //this case is impossible

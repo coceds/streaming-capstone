@@ -8,6 +8,8 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.streaming.kafka.KafkaUtils
 import org.apache.spark.streaming.{Seconds, State, StateSpec, StreamingContext}
 
+import scala.collection.mutable
+
 object DStreamWay {
 
   def main(args: Array[String]) {
@@ -37,49 +39,32 @@ object DStreamWay {
         .map(record => convertToEvent(record._2))
         //filter events here if required
         //.checkpoint(Seconds(batch * 5)) //todo: checkpoint rdd
+        .filter(e => e.eventType == "click" || e.eventType == "view")
         .map(event => (event.ip, event))
-        .mapValues(e => List(e))
-        .reduceByKeyAndWindow((txs, otherTxs) => txs ++ otherTxs, (all, old) => all diff old, Seconds(batch * length), Seconds(batch))
-        .mapWithState(
-          StateSpec.function((ip: String, newEventsOpt: Option[List[Event]],
-                              aggData: State[AggregatedEvents]) => {
-            val newEvents = newEventsOpt.getOrElse(List.empty[Event])
-
-            //todo: calculate these from newEvents!
-            val clicks = 1
-            val views = 1
-            val categories = Set(1, 2, 3)
-
-            val oldAggDataOption = aggData.getOption
-            aggData.update(
-              oldAggDataOption match {
-                case Some(value) => {
-                  if (value.size == 10) {
-                    //todo: remove oldest element first
-                    AggregatedEvents(value.size, value.clicks ++ List(clicks), value.views ++ List(views), value.categories ++ List(categories))
-                  } else {
-                    AggregatedEvents(value.size + 1, value.clicks ++ List(clicks), value.views ++ List(views), value.categories ++ List(categories))
-                  }
-                }
-                case None => AggregatedEvents(1, List(clicks), List(views), List(categories))
-              }
-            )
-          })
+        .mapValues(e => {
+          e.eventType match {
+            case "click" => ReducedEvents(1, 0, mutable.HashMap(e.category_id -> 1))
+            case "view" => ReducedEvents(0, 1, mutable.HashMap(e.category_id -> 1))
+          }
+        })
+        .reduceByKeyAndWindow(
+          (txs, otherTxs) => txs.add(otherTxs), //reduce new data for last 60 seconds
+          (all, old) => all.subtract(old), // inverse reduce data leaving the window (length * batch seconds)
+          Seconds(batch * length),
+          Seconds(batch)
         )
-        .stateSnapshots
         .filter(key => {
-          val clicks = key._2.clicks.sum
-          val views = key._2.views.sum
+          val clicks = key._2.clicks
+          val views = key._2.views
           val ratio = if (views == 0) {
             clicks
           } else {
             clicks / views
           }
-          val categories = key._2.categories.flatten.size
+          val categories = key._2.categories.size
           (clicks + views > 1000) || categories > 5 || ratio > 4
         })
         .print()
-
       ssc
     })
 
@@ -116,7 +101,47 @@ object DStreamWay {
                    @JsonProperty("ip") ip: String,
                    @JsonProperty("type") eventType: String)
 
+  //todo: Use clicks: Int, views: Int, categories: Map<String, Int> - key - category name, value - amount of times category is used for the interval
   case class AggregatedEvents(size: Int, clicks: List[Int], views: List[Int], categories: List[Set[Int]]) {
+  }
+
+  case class ReducedEvents(clicks: Int, views: Int, categories: mutable.HashMap[Int, Int]) {
+
+    def add(other: ReducedEvents): ReducedEvents = {
+      other.categories
+        .foreach(e => {
+          this.categories.get(e._1) match {
+            case Some(v) => this.categories.update(e._1, v + e._2)
+            case None => this.categories += e
+          }
+        })
+      ReducedEvents(
+        this.clicks + other.clicks,
+        this.views + other.views,
+        this.categories
+      )
+    }
+
+    def subtract(other: ReducedEvents): ReducedEvents = {
+      //todo: can we use same map here?
+      other.categories
+        .foreach(e => {
+          this.categories.get(e._1) match {
+            case Some(v) => {
+              v - e._2 match {
+                case value > 0 => this.categories.update(e._1, value)
+                case value == 0 => this.categories.remove(e._1)
+              }
+            }
+            //case None => this.categories //this case is impossible
+          }
+        })
+      ReducedEvents(
+        this.clicks + other.clicks,
+        this.views + other.views,
+        this.categories
+      )
+    }
   }
 
 }

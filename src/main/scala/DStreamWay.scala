@@ -4,11 +4,18 @@ import com.fasterxml.jackson.module.scala.DefaultScalaModule
 import com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper
 import kafka.serializer.StringDecoder
 import org.apache.commons.lang3.StringEscapeUtils
+import org.apache.kafka.common.serialization.StringDeserializer
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.streaming.kafka.KafkaUtils
 import org.apache.spark.streaming.{Seconds, State, StateSpec, StreamingContext}
 
 import scala.collection.mutable
+import scala.util.{Success, Try}
+import com.datastax.spark.connector._
+import org.apache.spark.sql.cassandra._
+import org.apache.spark.streaming.dstream.DStream
+import org.apache.spark.streaming.kafka010.KafkaUtils
+import org.apache.spark.streaming.kafka010.LocationStrategies.PreferConsistent
+import org.apache.spark.streaming.kafka010.ConsumerStrategies.Subscribe
 
 object DStreamWay {
 
@@ -17,12 +24,15 @@ object DStreamWay {
       .master("local[3]")
       .appName("Streaming capstone")
       .config("spark.driver.memory", "2g")
-      //.enableHiveSupport
+      .config("spark.cassandra.connection.host", "127.0.0.1") //todo: add host
       .getOrCreate()
-    val kafkaParams = Map[String, String](
-      "bootstrap.servers" -> "192.168.99.100:9092",
+    val kafkaParams = Map[String, Object](
+      "bootstrap.servers" -> "127.0.0.1:9092",
+      "key.deserializer" -> classOf[StringDeserializer],
+      "value.deserializer" -> classOf[StringDeserializer],
       "group.id" -> "capstone-group",
-      "auto.offset.reset" -> "smallest" // "smallest", "largest"
+      "auto.offset.reset" -> "earliest", //earliest latest // "smallest", "largest"
+      "enable.auto.commit" -> (false: java.lang.Boolean)
     )
 
     val checkpointDir = "data/checkpoint"
@@ -31,15 +41,35 @@ object DStreamWay {
     val streamingContext = StreamingContext.getOrCreate(checkpointDir, () => {
       val ssc = new StreamingContext(spark.sparkContext, Seconds(batch))
       ssc.checkpoint(checkpointDir)
-      //createStream(ssc, "192.168.99.100:2181", "capstone-group", Map("demo-1-standalone" -> 3))
-      val topicsSet = Set("demo-1-standalone")
-      val kafkaStream = KafkaUtils.createDirectStream[String, String, StringDecoder, StringDecoder](
-        ssc, kafkaParams, topicsSet)
-      kafkaStream
-        .map(record => convertToEvent(record._2))
-        //filter events here if required
+      val topicsSet = Set("file-standalone")
+      //      val kafkaStream = KafkaUtils.createDirectStream[String, String, StringDecoder, StringDecoder](
+      //        ssc, kafkaParams, topicsSet)
+      val kafkaStream = KafkaUtils.createDirectStream[String, String](
+        ssc,
+        PreferConsistent,
+        Subscribe[String, String](topicsSet, kafkaParams)
+      )
+      val eventStream: DStream[Event] = kafkaStream
+        .map(record => Try(convertToEvent(record.value())))
+        .filter(v => v.isSuccess)
+        .map(v => v.get)
         //.checkpoint(Seconds(batch * 5)) //todo: checkpoint rdd
         .filter(e => e.eventType == "click" || e.eventType == "view")
+
+
+      //save to cassandra
+      eventStream
+        .foreachRDD(rdd => {
+          if (!rdd.isEmpty()) {
+            rdd.saveToCassandra("capstone", "events",
+              SomeColumns("ip", "unix_time", "category_id", "eventtype" as "eventType"))
+          } else {
+            println("empty batch")
+          }
+
+        })
+
+      eventStream
         .map(event => (event.ip, event))
         .mapValues(e => {
           e.eventType match {
@@ -101,10 +131,8 @@ object DStreamWay {
                    @JsonProperty("ip") ip: String,
                    @JsonProperty("type") eventType: String)
 
-  //todo: Use clicks: Int, views: Int, categories: Map<String, Int> - key - category name, value - amount of times category is used for the interval
-  case class AggregatedEvents(size: Int, clicks: List[Int], views: List[Int], categories: List[Set[Int]]) {
-  }
 
+  //clicks: Int, views: Int, categories: Map<String, Int> - key - category name, value - amount of times category is used for the interval
   case class ReducedEvents(clicks: Int, views: Int, categories: mutable.HashMap[Int, Int]) {
 
     def add(other: ReducedEvents): ReducedEvents = {
